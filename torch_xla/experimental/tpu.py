@@ -130,7 +130,7 @@ def version() -> int:
   print("&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&& OUTPUT")
   print(env[xenv.ACCELERATOR_TYPE])
   match = re.match(r'^v(\d).*', env[xenv.ACCELERATOR_TYPE])
-  return int(match.groups()[0])
+  return 5 # int(match.groups()[0])
 
 
 def get_worker_ips() -> List[str]:
