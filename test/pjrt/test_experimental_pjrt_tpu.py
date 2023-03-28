@@ -64,6 +64,8 @@ class TestExperimentalPjrtTpu(parameterized.TestCase):
     expected = accelerator_devices[self.accelerator_type]
 
     devices_per_process = pjrt._run_multiprocess(xm.xla_device)
+    print(devices_per_process)
+    print("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^")
     self.assertDictEqual(devices_per_process, expected)
 
   @absltest.skipIf(
