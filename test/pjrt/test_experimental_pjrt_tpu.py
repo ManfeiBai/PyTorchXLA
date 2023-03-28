@@ -27,9 +27,6 @@ class TestExperimentalPjrtTpu(parameterized.TestCase):
       self.accelerator_type = tpu_env['ACCELERATOR_TYPE']
       # Number of logical devices per single-host TPU
       self.num_devices = {
-          'v2-8': 8,
-          'v3-8': 8,
-          'v4-8': 4,
           'v5litepod-128': 128,
       }[self.accelerator_type]
     except requests.HTTPError as e:
