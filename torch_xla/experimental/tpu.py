@@ -126,7 +126,9 @@ def version() -> int:
     env = get_tpu_env()
   except requests.HTTPError as e:
     raise EnvironmentError('Failed to get TPU metadata') from e
-
+  
+  print("&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&& OUTPUT")
+  print(env[xenv.ACCELERATOR_TYPE])
   match = re.match(r'^v(\d).*', env[xenv.ACCELERATOR_TYPE])
   return int(match.groups()[0])
 
