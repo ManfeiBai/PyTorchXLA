@@ -90,6 +90,8 @@ class TestExperimentalPjrtTpu(parameterized.TestCase):
       raise NotImplementedError('Test not implemented for {}'.format(
           self.accelerator_type))
     expected = accelerator_devices[self.accelerator_type]
+    print("^^^^^^&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&")
+    print(expected)
 
     devices_per_process = pjrt._run_multiprocess(xm.xla_device)
     print(devices_per_process)
