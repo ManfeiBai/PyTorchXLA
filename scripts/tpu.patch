@@ -1,0 +1,18 @@
+--- /usr/local/lib/python3.8/dist-packages/torch_xla/experimental/tpu.py	2023-04-03 20:15:07.150108814 +0000
++++ /usr/local/lib/python3.8/dist-packages/torch_xla/experimental/tpu_patched.py	2023-04-03 20:16:56.209996699 +0000
+@@ -28,6 +28,10 @@
+     'v3-512': '8,8,1',
+     'v3-1024': '8,16,1',
+     'v3-2048': '16,16,1',
++    'v5lite-4': '1,1,1',
++    'v5litepod-4': '1,1,1',
++    'v5litepod-16': '2,2,1',
++    'v5litepod-64': '4,4,1',
+     # Get v4 host bounds from TPU metadata
+ }
+ 
+@@ -193,3 +197,4 @@
+ 
+   master_worker_id = int(t.cpu())
+   return worker_ips[master_worker_id]
++
