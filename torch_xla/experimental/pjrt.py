@@ -4,17 +4,20 @@ import functools
 import itertools
 import logging
 import os
+import sys
+import tempfile
 from itertools import chain
 from typing import Callable, Dict, List, Optional, Tuple, TypeVar
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch_xla
 import torch_xla.core.xla_env_vars as xenv
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_backend
 import torch_xla.utils.utils as xu
-from torch_xla.experimental import tpu, gpu
+from torch_xla.experimental import tpu
 
 R = TypeVar('R')
 FN = TypeVar('FN')
@@ -31,48 +34,14 @@ def set_device_type(pjrt_device: str) -> None:
   os.environ[xenv.PJRT_DEVICE] = pjrt_device
 
 
-def _maybe_select_default_device():
-  # Skip if runtime is already configured
-  if xu.getenv_as(
-      xenv.PJRT_SELECT_DEFAULT_DEVICE, str, '1'
-  ) == '0' or xenv.PJRT_DEVICE in os.environ or xenv.GPU_NUM_DEVICES in os.environ or any(
-      env.startswith('XRT_') for env in os.environ):
-    return
-
-  logging.warning(
-      'XRT configuration not detected. Defaulting to preview PJRT '
-      'runtime. To silence this warning and continue using PJRT, '
-      'explicitly set PJRT_DEVICE to a supported device or configure XRT. To '
-      'disable default device selection, set PJRT_SELECT_DEFAULT_DEVICE=0')
-  # TODO: Update this link in the release branch
-  logging.warning('For more information about the status of PJRT, see '
-                  'https://github.com/pytorch/xla/blob/master/docs/pjrt.md')
-  # Check for libtpu _and_ the TPU device
-  if torch_xla._found_libtpu and os.path.exists('/dev/accel0'):
-    logging.warning('libtpu.so and TPU device found. Setting PJRT_DEVICE=TPU.')
-    os.environ[xenv.PJRT_DEVICE] = 'TPU'
-  else:
-    logging.warning('Defaulting to PJRT_DEVICE=CPU')
-    os.environ[xenv.PJRT_DEVICE] = 'CPU'
-  # TODO(wcromar): Detect GPU device too
-
-
 def device_type() -> Optional[str]:
-  """Returns the currrent PjRt device type.
-
-  Selects a default device if none has been configured
-  """
-  _maybe_select_default_device()
+  """Returns the currrent PjRt device type."""
   pjrt_device = xu.getenv_as(xenv.PJRT_DEVICE, str)
-  return pjrt_device.split('_')[0] if pjrt_device else pjrt_device
+  return 'TPU' if pjrt_device and pjrt_device.startswith('TPU') else pjrt_device
 
 
 def using_pjrt() -> bool:
-  """Returns whether this process is using PjRt runtime.
-
-  Selects a default device if none has been configured.
-  """
-  _maybe_select_default_device()
+  """Returns whether this process is using PjRt runtime."""
   return device_type() is not None
 
 
@@ -122,7 +91,7 @@ def xla_device(n: Optional[int] = None,
 @requires_pjrt
 def local_process_count() -> int:
   """Returns the number of processes running on this host."""
-  return xu.getenv_as(xenv.PJRT_LOCAL_PROCESS_COUNT, int, defval=1)
+  return xu.getenv_as('LOCAL_WORLD_SIZE', int, defval=1)
 
 
 @requires_pjrt
@@ -169,7 +138,7 @@ def local_ordinal() -> int:
   """Returns local ordinal of this thread within this host.
 
   Local ordinal is in range [0, local_device_count)."""
-  local_rank = xu.getenv_as(xenv.PJRT_LOCAL_PROCESS_RANK, int, 0)
+  local_rank = xu.getenv_as('LOCAL_RANK', int, 0)
   devices_per_process = addressable_device_count()
   return local_rank * devices_per_process + xla_device().index
 
@@ -211,9 +180,11 @@ def _merge_replica_results(
 
 
 @requires_pjrt
-def _run_thread_per_device(
-    local_rank: int, local_world_size: int, fn: Callable[[], R],
-    initializer_fn: Callable[[int, int], None]) -> Dict[int, R]:
+def _run_thread_per_device(local_rank: int,
+                           local_world_size: int,
+                           fn: Callable[[], R],
+                           initializer_fn: Callable[[int, int], None],
+                           master_port: int = 12355) -> Dict[int, R]:
   """Runs `fn` in a separate thread on each addressable device.
 
   Args:
@@ -237,8 +208,24 @@ def _run_thread_per_device(
 
     return fn()
 
+  # TODO(wcromar): remove this when the TPU master IP becomes predictable
+  def _discover_tpu_master_worker_ip(device: torch.device):
+    torch_xla._XLAC._xla_set_default_device(device)
+
+    return tpu.discover_master_worker_ip()
+
   with concurrent.futures.ThreadPoolExecutor(
       max_workers=num_threads) as executor:
+    if os.getenv('PJRT_INIT_TORCH_DISTRIBUTED', '0') == '1':
+      if device_type() == 'TPU':
+        # HACK: need to call with each device since it relies on an XLA collective
+        master_ip = next(executor.map(_discover_tpu_master_worker_ip, devices))
+        init_method = f'tcp://{master_ip}:{master_port}'
+      else:
+        init_method = None
+
+      init_pjrt_process_group(init_method=init_method)
+
     device_ordinals = [
         torch_xla._XLAC._xla_get_device_ordinal(d) for d in devices
     ]
@@ -249,7 +236,11 @@ def _run_thread_per_device(
 
 
 @requires_pjrt
-def _run_singleprocess(fn: Callable[..., R], *args, **kwargs) -> Dict[int, R]:
+def _run_singleprocess(fn: Callable[..., R],
+                       *args,
+                       start_method: str = 'spawn',
+                       master_port: int = 12355,
+                       **kwargs) -> Dict[int, R]:
   """Runs `fn` on a single device core.
 
   Spawns one process on a single physical device (e.g. TPU chip).
@@ -257,25 +248,28 @@ def _run_singleprocess(fn: Callable[..., R], *args, **kwargs) -> Dict[int, R]:
   Args:
     fn: Function to run on the device devices
     args: args to pass to `fn`
+    start_method: The Python `multiprocessing` process creation method.
+      Default: `spawn`
     kwargs: kwargs to pass to `fn`
 
   Returns:
     the result of calling `fn`.
   """
-  os.environ.setdefault(xenv.PJRT_LOCAL_PROCESS_COUNT, '1')
+  os.environ.setdefault('LOCAL_WORLD_SIZE', '1')
 
   if device_type() == 'TPU':
     tpu.configure_one_chip_topology()
 
   xm.set_replication(xm.xla_device(), [])
+  init_pjrt_process_group()
 
-  return fn(*args, **kwargs)
+  return fn()
 
 
 @requires_pjrt
 def _initialize_multiprocess(local_rank: int, local_world_size: int):
-  os.environ.setdefault(xenv.PJRT_LOCAL_PROCESS_RANK, str(local_rank))
-  os.environ.setdefault(xenv.PJRT_LOCAL_PROCESS_COUNT, str(local_world_size))
+  os.environ.setdefault('LOCAL_RANK', str(local_rank))
+  os.environ.setdefault('LOCAL_WORLD_SIZE', str(local_world_size))
 
   if device_type() == 'TPU':
     tpu.configure_topology(local_rank, local_world_size)
@@ -303,9 +297,6 @@ def _run_multiprocess(fn: Callable[..., R],
   """
   if device_type() == 'TPU':
     num_processes = tpu.num_local_processes()
-  elif device_type() == 'GPU':
-    num_processes = gpu.num_local_processes()
-    gpu.initialize_distributed_runtime(num_processes)
   else:
     num_processes = 1
 
@@ -322,9 +313,6 @@ def _run_multiprocess(fn: Callable[..., R],
     replica_results = list(
         itertools.chain.from_iterable(
             result.items() for result in process_results))
-
-  if device_type() == 'GPU':
-    gpu.shutdown_distributed_runtime()
 
   return _merge_replica_results(replica_results)
 
@@ -358,7 +346,7 @@ def spawn(fn: Callable,
   spawn_fn = _SpawnFn(fn, *args)
 
   if nprocs == 1:
-    return _run_singleprocess(spawn_fn)
+    return _run_singleprocess(spawn_fn, start_method=start_method)
   elif nprocs is not None:
     logging.warning('Unsupported nprocs (%d), ignoring...' % nprocs)
 
@@ -367,13 +355,12 @@ def spawn(fn: Callable,
 
 @requires_pjrt
 def _initialize_single_process(local_rank: int, local_world_size: int):
-  os.environ.setdefault(xenv.PJRT_LOCAL_PROCESS_RANK, str(local_rank))
-  os.environ.setdefault(xenv.PJRT_LOCAL_PROCESS_COUNT, str(local_world_size))
+  os.environ.setdefault('LOCAL_RANK', str(local_rank))
+  os.environ.setdefault('LOCAL_WORLD_SIZE', str(local_world_size))
 
 
 def spawn_threads(fn: Callable, args: Tuple = ()) -> None:
   """Run function in one process with one thread per addressable device."""
-  assert device_type() != 'GPU', "spawn_threads does not support GPU device"
   spawn_fn = _SpawnFn(fn, *args)
   _run_thread_per_device(
       local_rank=0,
@@ -443,3 +430,61 @@ def rendezvous(tag: str, payload: bytes,
   xm.mark_step()
 
   return [bytes(p.cpu().tolist()) for p in payloads]
+
+
+def init_pjrt_process_group(init_method: Optional[str] = None, **kwargs):
+  if not init_method and process_count() == 1:
+    init_method = f'file://{tempfile.mktemp()}'
+
+  dist.init_process_group(
+      'xla',
+      init_method,
+      rank=process_index(),
+      world_size=process_count(),
+      **kwargs)
+
+
+class DistributedDataParallel(nn.Module):
+  """Emulate DistributedDataParallel on TPUs.
+
+  Very experimental! There may still be correctness and performance issues to
+  work out. This class may be removed at any time.
+
+  torch.nn.parallel.DistributedDataParallel has additional overhead for gradient
+  bucketing that does not benefit TPUs. This implemenation may give better
+  performance on TPUs.
+
+  Compatible with multithreaded workloads required for multi-client execution on
+  TPU v2/v3.
+
+  Does not support model parallelism.
+  """
+
+  @staticmethod
+  def _reduce_grad(grad: torch.Tensor) -> torch.Tensor:
+    """Average gradients across replicas."""
+    return xm.all_reduce(xm.REDUCE_SUM, grad, scale=1. / global_device_count())
+
+  def __init__(self,
+               module: nn.Module,
+               *,
+               broadcast_buffers: bool = True,
+               **kwargs):
+    super().__init__()
+
+    if kwargs:
+      logging.warn('Ignoring DDP arguments: %s', str(kwargs.keys()))
+
+    assert dist.is_available() and dist.get_backend() == 'xla'
+    self._module = module
+    self._broadcast_buffers = broadcast_buffers
+
+    for p in module.parameters():
+      p.register_hook(self._reduce_grad)
+
+  def forward(self, x: torch.Tensor):
+    if self._broadcast_buffers:
+      for b in self._module.buffers():
+        dist.broadcast(b, src=0)
+
+    return self._module(x)
